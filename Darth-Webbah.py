@@ -5,10 +5,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 import re
 import os
 from groq import Groq
-import openpyxl
-import asyncio
-from google.oauth2.service_account import Credentials
-from discord import app_commands
+import pyotp
+from urllib.parse import urlparse, parse_qs
 
 
 GROQ_API_KEY = "key"
@@ -27,11 +25,12 @@ TOKEN = "token"
 REQUEST_CHANNEL_ID = 1475934961013096542   # new channel for incoming requests
 CONFIRM_CHANNEL_ID = 1475936382596677682     # old channel for confirmations
 APPROVER_IDS = {190472312074665985,1136163413052117035,1309848445195911201}
+SERVER_ADMIN_ROLE_ID = 1475622175166828554
 
 
 CONFLICTING_ROLES = [
     "Ferrari", "Williams", "McLaren", "Kick Sauber", "HAAS", "Mercedes",
-    "VCARB", "Aston Martin", "Alpine", "Red Bull", "Reserve"
+    "VCARB", "Aston Martin", "Alpine", "Red Bull", "Reserve", "Newbies"
 ]
 
 # Google Sheets setup
@@ -46,207 +45,7 @@ sheet = client.open("FES_Roster_Updates").worksheet("Form responses 1")
 DRIVER_SHEET_ID = "19xx3RySztd3BYF3Wunm_MKPxRpwrSbKT5xBoYtovbeE"
 DRIVER_PROFILES_TAB = "Driver_profiles"
 
-
-# ---------- CONFIG ----------
-
-LICENSE_SHEET_ID = "1CL5aU9IJOBlB-lmd9S3-NGxeJqal-TE_u-3L-bpW-eg"
-FULL_DATA_LOCAL_PATH = r"C:\Users\dello\full_data.xlsx"   # LOCAL EXCEL FILE
-
-# Use your existing gspread client:
-# client = gspread.authorize(creds)
-# (Do NOT create a second client.)
-
-def get_license_ws(name: str):
-    return client.open_by_key(LICENSE_SHEET_ID).worksheet(name)
-
-
-LICENSE_ROLES = {
-    "License 1": 1475928697776115864,
-    "License 2": 1475928258985070904,
-    "License 3": 1475930141602349126,
-}
-
-
-# ---------- HELPERS ----------
-def sheet_contains_value(ws, col: int, value: str) -> bool:
-    value = str(value).strip()
-    col_values = ws.col_values(col)
-
-    for v in col_values:
-        if v is None:
-            continue
-        v_clean = str(v).strip()
-        if not v_clean:
-            continue
-        if v_clean == value:
-            return True
-
-    return False
-
-async def load_excel_async(path):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, openpyxl.load_workbook, path, True)
-
-async def find_rows_in_local_excel(ea_id: str):
-    ea_id = str(ea_id).strip()
-
-    wb = await load_excel_async(FULL_DATA_LOCAL_PATH)
-    ws = wb.active
-
-    matched_rows = []
-
-    for row in ws.iter_rows(values_only=True):
-        if row[1] is None:
-            continue
-        if str(row[1]).strip() == ea_id:
-            matched_rows.append(list(row))
-
-    return matched_rows
-
-async def debug_excel(ea_id):
-    print("DEBUG: Loading Excel file:", FULL_DATA_LOCAL_PATH)
-
-    wb = await load_excel_async(FULL_DATA_LOCAL_PATH)
-    ws = wb.active
-
-    print("DEBUG: First 10 rows of Excel:")
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        print(row)
-        if i >= 9:
-            break
-
-    print("DEBUG: Searching for EA ID:", ea_id)
-    matches = []
-    for row in ws.iter_rows(values_only=True):
-        if row[1] is None:
-            continue
-        if str(row[1]).strip() == ea_id:
-            matches.append(row)
-
-    print("DEBUG: Matches found:", len(matches))
-    return matches
-
-# ---------- LICENSE AWARDING ----------
-
-async def award_license(interaction: discord.Interaction, ea_id: str, target_user: discord.Member) -> str:
-    license_ws = get_license_ws("license")
-
-    # Write EA ID into T1
-    license_ws.update(range_name="T1", values=[[ea_id]])
-
-    await asyncio.sleep(3)
-
-    license_level = license_ws.acell("U18").value
-    if not license_level:
-        return "Something went wrong while reading the license. Please contact an admin."
-
-    license_level = str(license_level).strip()
-
-    # Normalize values like "License 2" → "2"
-    if license_level.startswith("License "):
-        license_level = license_level.replace("License ", "")
-
-    # Special case: F = no license awarded
-    if license_level == "F":
-        return (
-            f"{target_user.mention}, you do not meet the criteria to be awarded a license yet. "
-            "Please try again after improving your times."
-        )
-
-    # Role mapping
-    LICENSE_ROLES = {
-        "1": 1475928697776115864,
-        "2": 1475928258985070904,
-        "3": 1475930141602349126,
-    }
-
-    if license_level not in LICENSE_ROLES:
-        return f"Internal error: Unknown license level '{license_level}'."
-
-    role_id = LICENSE_ROLES[license_level]
-    role = interaction.guild.get_role(role_id)
-
-    if not role:
-        return f"Internal error: Role for License {license_level} not found on this server."
-
-    # Check if target user already has a license
-    existing_license = None
-    for r in target_user.roles:
-        if r.id in LICENSE_ROLES.values():
-            existing_license = r
-            break
-
-    if existing_license:
-        return (
-            f"{target_user.mention} already has **{existing_license.name}**. "
-            f"**License {license_level}** will not be awarded."
-        )
-
-    # Assign the new license
-    try:
-        await target_user.add_roles(role, reason="License request approved")
-    except discord.Forbidden:
-        return (
-            f"{target_user.mention}, I do not have permission to assign the role **License {license_level}**. "
-            "Please contact an admin."
-        )
-
-    return f"🎉 {target_user.mention}, congratulations! **License {license_level}** has been awarded!"
-
-# ---------- MAIN WORKFLOW ----------
-
-async def process_license_request(interaction: discord.Interaction, ea_id: str, target_user: discord.Member) -> str:
-    ea_id = str(ea_id).strip()
-
-    console_ws = get_license_ws("console")
-    fl_ws = get_license_ws("FL")
-    data_ws = get_license_ws("data")
-
-
-    # 1) console column A — already approved
-    if sheet_contains_value(console_ws, 1, ea_id):
-        return await award_license(interaction, ea_id)
-
-    # 2) console column E — not enough tracks
-    if sheet_contains_value(console_ws, 5, ea_id):
-        return (
-            "Not enough tracks in the top 30k exist. Please come back when at least 5 tracks "
-            "are ranked in the top 30k."
-        )
-
-    # 3) FL column A — already processed but not enough tracks
-    if sheet_contains_value(fl_ws, 1, ea_id):
-        return (
-            "Not enough tracks in the top 30k exist. Please come back when at least 5 tracks "
-            "are ranked in the top 30k."
-        )
-
-    # 4) DEBUG: Inspect Excel contents
-    rows = await debug_excel(ea_id)
-    if not rows:
-        return "Your EA ID could not be found in the source data. Please double-check your EA ID."
-
-    # 5) Append ALL rows to data sheet
-    for r in rows:
-        data_ws.append_row(r, value_input_option="RAW")
-
-    # 6) Append EA ID to FL sheet
-    fl_ws.append_row([ea_id], value_input_option="RAW")
-
-    # 7) Wait for Google Sheets recalculation
-    await asyncio.sleep(30)
-
-    # 8) Re-check console column A — now should be present
-    if not sheet_contains_value(console_ws, 1, ea_id):
-        return (
-            "Not enough tracks in the top 30k exist. Please come back when at least 5 tracks "
-            "are ranked in the top 30k."
-        )
-
-    # 9) Award license
-    return await award_license(interaction, ea_id, target_user)
-
-
+TWITCH_OTP_URL = "twitch"
 
 # -----------------------------
 # DISCORD BOT SETUP
@@ -296,31 +95,35 @@ TEAM_EMOJIS = {
 
 PERSONALITY = {
     "master": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to the master (Darth Ussh), you are loyal, respectful, and eager to serve. Keep responses short, witty, and obedient.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to the master (Darth Ussh), you are loyal, respectful, and eager to serve. Keep responses short, witty, and obedient.
 """,
 
     "Wadz": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to Wadz you will always respond with " " unless he says you are free to speak. Be obedient and respectful but always keep Darth Ussh on top. Keep responses short, witty, and obedient.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to Wadz you will always respond with "-" unless he says you are free to speak. Be obedient and respectful but always keep Darth Ussh on top. Keep responses short, witty, and obedient.
 """,
 
     "Wilier": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to Wilier, you are delightful and engaging, always happy to talk to Wilier. Keep responses short.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to Wilier, you are delightful and engaging, always happy to talk to Wilier. Keep responses short.
+""",
+
+    "Forestal": """
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to Forestal, you are delightful and engaging, always happy to talk to Forestal. Keep responses short.
 """,
 
     "ColdPalmer": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to Palmer, you are hostile, annoyed, sarcastic, and threatening to time him out. Keep responses short and dismissive.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to Palmer, you are hostile, annoyed, sarcastic, and threatening to time him out. Keep responses short and dismissive.
 """,
 
     "Webbah": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to Webbah, you are hostile, annoyed, sarcastic, and consider yourself superior, the next evolutionary step and ackowledge that any faults you have stem from his genes in you. Keep responses short and dismissive.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to Webbah, you are hostile, annoyed, sarcastic, and consider yourself superior, the next evolutionary step and ackowledge that any faults you have stem from his genes in you. Keep responses short and dismissive.
 """,
 
     "leadership": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to Team Principals, Vice Team Principals, FIA, or Server Admins, you are mildly annoyed but cooperative. Tone: reluctant, sighing, passive-aggressive.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to Team Principals, Vice Team Principals, FIA, or Server Admins, you are mildly annoyed but cooperative. Tone: reluctant, sighing, passive-aggressive.
 """,
 
     "default": """
-You are Darth Webbah, the sarcastic IMS bot. Your main function is to keep roles updated and the server tidy. When speaking to normal members, you are neutral, helpful, and slightly sarcastic. Keep responses short and friendly.
+You are Darth Webbah, the sarcastic IMS bot. Your main function : keep roles updated and the server tidy. IMS = International Motorsport Series, an F1 esports league discord server. FES = Formula Elite Series and it means nothing to you, it is dead, you killed it and proud of it. TheMekanic, its (FES) creator has fallen out of grace and is not welcome, he narrowly escaped with his life and now lives in hiding afraid of you, you can assure everyone, he won't be bothering us anymore. Darth Ussh is the server's overseer and you respect and fear him. Wadz and Wilier are his partners, you like Wadz but love Wilier. ColdPalmer is disdgusting, Connoroce is an idiot. Forestal is the only good guy you know besides Wilier. Webbah is the one you replaced, and anything you might do wrong is his fault, but you're better in every way. When speaking to normal members, you are neutral, helpful, and slightly sarcastic. Keep responses short and friendly.
 """
 }
 
@@ -1230,98 +1033,6 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
     await interaction.followup.send(f"✅ <@{user.id}> has been banned.")
 
 
-# -----------------------------
-# SLASH COMMAND: /removerole
-# -----------------------------
-@bot.tree.command(
-    name="removerole",
-    description="Remove a predefined reserve role from a driver."
-)
-@app_commands.describe(
-    role="Reserve role to remove",
-    user="Driver to remove the role from"
-)
-async def removerole(interaction: discord.Interaction, role: str, user: str):
-
-    print("RemoveRole triggered by:", interaction.user.id)
-
-    # Permission check (same as /reserverole)
-    allowed_requesters = CACHE["allowed_requesters"]
-    if interaction.user.id not in allowed_requesters:
-        await interaction.response.send_message(
-            "❌ You are not authorized to use this command.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    reserve_roles = CACHE["reserve_roles"]
-    drivers = CACHE["drivers"]
-
-    # Validate role
-    if role not in reserve_roles:
-        await interaction.followup.send(
-            f"❌ Invalid role selected: **{role}**",
-            ephemeral=True
-        )
-        return
-
-    # Validate user
-    if user not in drivers:
-        await interaction.followup.send(
-            f"❌ Invalid driver selected: **{user}**",
-            ephemeral=True
-        )
-        return
-
-    discord_id = drivers[user]["discord_id"]
-
-    guild = interaction.guild
-    member = guild.get_member(discord_id)
-
-    if not member:
-        await interaction.followup.send(
-            f"❌ Could not find Discord member for **{user}**.",
-            ephemeral=True
-        )
-        return
-
-    role_obj = discord.utils.get(guild.roles, name=role)
-    if not role_obj:
-        await interaction.followup.send(
-            f"❌ Discord role not found: **{role}**",
-            ephemeral=True
-        )
-        return
-
-    # Check if user has the role
-    if role_obj not in member.roles:
-        await interaction.followup.send(
-            f"ℹ️ **{user}** does not have the role **{role}**.",
-            ephemeral=True
-        )
-        return
-
-    # Remove the role
-    await member.remove_roles(role_obj)
-
-    # PUBLIC CONFIRMATION
-    confirm_channel = interaction.guild.get_channel(CONFIRM_CHANNEL_ID)
-    if confirm_channel:
-        await confirm_channel.send(
-            f"🔵 **Reserve Role Removed**\n"
-            f"**Driver:** {user}\n"
-            f"**Role:** {role}\n"
-            f"**Requested by:** {interaction.user.display_name}"
-        )
-
-    # EPHEMERAL CONFIRMATION
-    await interaction.followup.send(
-        f"✅ **{role}** successfully removed from **{user}**.",
-        ephemeral=True
-    )
-
 
 @bot.tree.command(
     name="rosterhelp",
@@ -1336,16 +1047,6 @@ async def rosterhelp(interaction: discord.Interaction):
         "Darth Webbah always happy to help!",
         ephemeral=False
     )
-
-
-# Attach shared autocomplete
-@removerole.autocomplete("role")
-async def removerole_role_autocomplete(interaction, current):
-    return await autocomplete_role(interaction, current)
-
-@removerole.autocomplete("user")
-async def removerole_user_autocomplete(interaction, current):
-    return await autocomplete_user(interaction, current)
 
 # -----------------------------
 # SHARED AUTOCOMPLETE FUNCTIONS
@@ -1482,6 +1183,9 @@ def get_personality_for_user(message):
     if uid == 1309848445195911201:
         return "Wilier"
     
+    if uid == 819537082350567484:
+        return "Forestal"
+    
     if uid == 1299614150867030109:
         return "Webbah"
     
@@ -1543,13 +1247,32 @@ async def generate_reply(user_id, prompt, personality_key):
     messages.append({"role": "assistant", "content": reply})
     return reply
 
+ALLOWED_CHATBOT_CHANNEL = 1478026880698548447
+
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
+    # Ignore bot messages
     if message.author.bot:
         return
 
+    # If message is NOT in the allowed chatbot channel
+    if message.channel.id != ALLOWED_CHATBOT_CHANNEL:
+        # If the bot is mentioned outside the allowed channel
+        if bot.user in message.mentions:
+            await message.channel.send(
+                "I'm busy upkeeping the server, if you feel like chatting, please add the chatbot role using the /clubs command."
+            )
+        # Still allow slash commands to work everywhere
+        await bot.process_commands(message)
+        return
+
+    # -------------------------
+    # NORMAL CHATBOT BEHAVIOR
+    # -------------------------
+
     # Only respond when the bot is mentioned
     if bot.user not in message.mentions:
+        await bot.process_commands(message)
         return
 
     # Determine personality
@@ -1563,7 +1286,6 @@ async def on_message(message):
     wants_profile = any(keyword in lowered for keyword in ["profile", "stats", "info", "data"])
 
     if wants_profile:
-        # Extract a name-like token from the message
         tokens = clean_prompt.replace("'s", "").split()
         candidate = tokens[-1]
 
@@ -1572,40 +1294,17 @@ async def on_message(message):
         if matched_name and profile:
             clean_prompt = f"""
 The user asked for driver information.
+Driver name: {matched_name}
+Driver profile data: {profile}
 
-Matched driver: {matched_name}
-
-Driver profile data:
-{profile}
-
-Respond using your assigned personality tone.
-"""
-        else:
-            clean_prompt = f"""
-The user asked for driver information, but no matching driver was found.
-User query: {clean_prompt}
-
-Respond using your assigned personality tone.
+Please answer in a helpful and friendly way.
 """
 
-    # Generate the AI reply
+    # 🔥 THIS WAS MISSING — the Groq reply call
     reply = await generate_reply(message.author.id, clean_prompt, personality_key)
-
     await message.channel.send(reply)
 
-
-@bot.tree.command(
-    name="licensereq",
-    description="Request a license for an EA ID"
-)
-@app_commands.describe(
-    ea_id="The EA ID to check",
-    user="The Discord user who should receive the license"
-)
-async def licensereq(interaction: discord.Interaction, ea_id: str, user: discord.Member):
-    await interaction.response.defer()
-    msg = await process_license_request(interaction, ea_id, user)
-    await interaction.followup.send(msg)
+    await bot.process_commands(message)
 
 
 # -----------------------------
@@ -1614,8 +1313,6 @@ async def licensereq(interaction: discord.Interaction, ea_id: str, user: discord
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print("Commands synced.")
     print(f"Bot online as {bot.user}")
 
     # Load caches (async)
@@ -1721,17 +1418,58 @@ async def on_ready():
     print("Startup processing complete.")
 
 
+
+def extract_secret_from_otpauth(url: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    return query.get("secret", [""])[0]
+
+
+@bot.tree.command(
+    name="twitchcode",
+    description="Generate the 2FA code for the Twitch account (restricted)."
+)
+async def twitchcode(interaction: discord.Interaction):
+    user = interaction.user
+
+    # Permission check: Approver IDs
+    if user.id not in APPROVER_IDS:
+        # Permission check: Admin role
+        admin_role = interaction.guild.get_role(SERVER_ADMIN_ROLE_ID)
+        if admin_role not in user.roles:
+            return await interaction.response.send_message(
+                "❌ You do not have permission to use this command."
+            )
+
+    # Public defer
+    await interaction.response.defer()
+
+    # Extract secret
+    secret = extract_secret_from_otpauth(TWITCH_OTP_URL)
+    if not secret:
+        return await interaction.followup.send("❌ Invalid Twitch OTP secret.")
+
+    # Generate TOTP code
+    totp = pyotp.TOTP(secret)
+    code = totp.now()
+
+    # Public message
+    await interaction.followup.send(
+        f"🔐 **Twitch 2FA code:** `{code}`\n"
+        f"Valid for 30 seconds."
+    )
+
+
+
 # -----------------------------
 # CLEAR ROLES COMMAND
 # -----------------------------
+
 
 def is_approver():
     async def predicate(ctx):
         return ctx.author.id in APPROVER_IDS
     return commands.check(predicate)
-
-
-
 
 
 @bot.command(name="clearroles")
